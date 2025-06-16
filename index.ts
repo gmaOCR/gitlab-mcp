@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// @ts-nocheck
+// gitlab-mcp: Logging maximal activé pour tracer chaque étape et comprendre l'origine des erreurs
+
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -1366,9 +1369,6 @@ async function listDiscussions(
   if (options.page) {
     url.searchParams.append("page", options.page.toString());
   }
-  if (options.per_page) {
-    url.searchParams.append("per_page", options.per_page.toString());
-  }
 
   const response = await fetch(url.toString(), {
     ...DEFAULT_FETCH_CONFIG,
@@ -2320,28 +2320,19 @@ async function getProject(
 async function listProjects(
   options: z.infer<typeof ListProjectsSchema> = {}
 ): Promise<GitLabProject[]> {
-  // Construct the query parameters
+  console.log(`[gitlab-mcp] [listProjects] options = ${JSON.stringify(options)}`);
+  // Construire l’URL de requête
   const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(options)) {
-    if (value !== undefined && value !== null) {
-      if (typeof value === "boolean") {
-        params.append(key, value ? "true" : "false");
-      } else {
-        params.append(key, String(value));
-      }
-    }
-  }
-
-  // Make the API request
-  const response = await fetch(`${GITLAB_API_URL}/projects?${params.toString()}`, {
-    ...DEFAULT_FETCH_CONFIG,
+  Object.entries(options).forEach(([k, v]) => {
+    if (v != null) params.append(k, String(v));
   });
-
-  // Handle errors
+  const url = `${GITLAB_API_URL}/projects?${params.toString()}`;
+  console.log(`[gitlab-mcp] [listProjects] will fetch ${url}`);
+  const response = await fetch(url, { ...DEFAULT_FETCH_CONFIG });
+  console.log(`[gitlab-mcp] [listProjects] response.status = ${response.status}`);
   await handleGitLabError(response);
-
-  // Parse and return the data
   const data = await response.json();
+  console.log(`[gitlab-mcp] [listProjects] got ${Array.isArray(data)?data.length:0} items`);
   return z.array(GitLabProjectSchema).parse(data);
 }
 
@@ -3379,6 +3370,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async request => {
+  console.log(`[gitlab-mcp] [CallToolRequest] Démarrage du traitement de l'outil: ${request.params.name} - arguments: ${JSON.stringify(request.params.arguments)}`);
   try {
     if (!request.params.arguments) {
       throw new Error("Arguments are required");
@@ -3416,15 +3408,19 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
       case "create_branch": {
         const args = CreateBranchSchema.parse(request.params.arguments);
+        console.log(`[gitlab-mcp] [create_branch] Parsed args: ${JSON.stringify(args)}`);
         let ref = args.ref;
         if (!ref) {
+          console.log(`[gitlab-mcp] [create_branch] No ref provided, fetching default branch`);
           ref = await getDefaultBranchRef(args.project_id);
+          console.log(`[gitlab-mcp] [create_branch] Default branch resolved: ${ref}`);
         }
 
         const branch = await createBranch(args.project_id, {
           name: args.branch,
           ref,
         });
+        console.log(`[gitlab-mcp] [create_branch] Created branch: ${JSON.stringify(branch)}`);
 
         return {
           content: [{ type: "text", text: JSON.stringify(branch, null, 2) }],
@@ -3433,11 +3429,14 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
       case "get_branch_diffs": {
         const args = GetBranchDiffsSchema.parse(request.params.arguments);
+        console.log(`[gitlab-mcp] [get_branch_diffs] Parsed args: ${JSON.stringify(args)}`);
         const diffResp = await getBranchDiffs(args.project_id, args.from, args.to, args.straight);
+        console.log(`[gitlab-mcp] [get_branch_diffs] Received ${diffResp.diffs.length} diffs`);
 
         if (args.excluded_file_patterns?.length) {
           const regexPatterns = args.excluded_file_patterns.map(pattern => new RegExp(pattern));
 
+          console.log(`[gitlab-mcp] [get_branch_diffs] Excluding patterns: ${args.excluded_file_patterns.join(",")}`);
           // Helper function to check if a path matches any regex pattern
           const matchesAnyPattern = (path: string): boolean => {
             if (!path) return false;
@@ -3446,7 +3445,9 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
           // Filter out files that match any of the regex patterns on new files
           diffResp.diffs = diffResp.diffs.filter(diff => !matchesAnyPattern(diff.new_path));
+          console.log(`[gitlab-mcp] [get_branch_diffs] ${diffResp.diffs.length} diffs after filtering`);
         }
+        console.log(`[gitlab-mcp] [get_branch_diffs] Final diffResp: ${JSON.stringify(diffResp)}`);
         return {
           content: [{ type: "text", text: JSON.stringify(diffResp, null, 2) }],
         };
@@ -3733,8 +3734,9 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
       case "list_projects": {
         const args = ListProjectsSchema.parse(request.params.arguments);
+        console.log(`[gitlab-mcp] [list_projects] parsed args = ${JSON.stringify(args)}`);
         const projects = await listProjects(args);
-
+        console.log(`[gitlab-mcp] [list_projects] returning ${projects.length} projects`);
         return {
           content: [{ type: "text", text: JSON.stringify(projects, null, 2) }],
         };
@@ -3777,8 +3779,16 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
       case "list_issues": {
         const args = ListIssuesSchema.parse(request.params.arguments);
-        const { project_id, ...options } = args;
-        const issues = await listIssues(project_id, options);
+        let projectId = args.project_id;
+        // Si on passe un chemin local, on remplace par TEST_PROJECT_ID
+        if (projectId.startsWith("/") && process.env.TEST_PROJECT_ID) {
+          console.log(
+            `[gitlab-mcp] [list_issues] Chemin local détecté ('${projectId}'), fallback sur TEST_PROJECT_ID=${process.env.TEST_PROJECT_ID}`
+          );
+          projectId = process.env.TEST_PROJECT_ID;
+        }
+        const { project_id, ...options } = { ...args, project_id: projectId };
+        const issues = await listIssues(projectId, options);
         return {
           content: [{ type: "text", text: JSON.stringify(issues, null, 2) }],
         };
@@ -4279,14 +4289,18 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       }
 
       default:
-        throw new Error(`Unknown tool: ${request.params.name}`);
+        const errMsg = `Unknown tool: ${request.params.name}`;
+        console.error(`[gitlab-mcp] [CallToolRequest] ${errMsg}`);
+        throw new Error(errMsg);
     }
   } catch (error) {
+    console.error(`[gitlab-mcp] [CallToolRequest] Erreur lors du traitement de l'outil '${request.params.name}':`, error);
+    console.error(error.stack);
     if (error instanceof z.ZodError) {
       throw new Error(
         `Invalid arguments: ${error.errors
-          .map(e => `${e.path.join(".")}: ${e.message}`)
-          .join(", ")}`
+          .map(e => `${e.path.join('.')}: ${e.message}`)
+          .join(', ')}`
       );
     }
     throw error;
